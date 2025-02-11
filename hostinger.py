@@ -1,74 +1,88 @@
+import subprocess
 import threading
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 from urllib.parse import urlparse
-import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
 
-# Menonaktifkan peringatan SSL yang tidak diverifikasi
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+result_queue = queue.Queue()
 
-# File input dan output
-input_file = "websites.txt"
-output_file = "result.txt"
-
-# Fungsi untuk memeriksa apakah sebuah website menggunakan platform Hostinger
-def check_hostinger_platform(url):
+def check_xsrf_token(url):
     try:
-        # Menambahkan skema jika tidak ada
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = "https://" + url
+        parsed_url = urlparse(url)
+        host = parsed_url.hostname if parsed_url.hostname else url
 
-        # Permintaan HTTP GET dengan timeout dan retry
-        response = requests.get(url, timeout=10, verify=False)
-        headers = response.headers
+        result = subprocess.run(['curl', '-I', f'http://{host}'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        # Cek header "Platform" untuk menentukan Hostinger
-        if "Platform" in headers and headers["Platform"].lower() == "hostinger":
+        if result.returncode == 0 and "XSRF-TOKEN" in result.stdout:
             return True
         return False
-
-    except requests.RequestException as e:
-        print(f"Gagal mengakses {url}. Error: {e}")
+    except Exception as e:
+        print(f"An error occurred while checking XSRF-TOKEN for {url}: {str(e)}")
         return False
 
-# Fungsi untuk memproses setiap website
-def process_website(url, result_lock, results):
-    if check_hostinger_platform(url):
-        with result_lock:
-            results.append(url)
-            print(f"{url} menggunakan platform Hostinger")
-
-# Fungsi utama untuk membaca input, memproses, dan menyimpan hasil
-def main():
-    # Membaca daftar website dari file
+def check_hostinger(url):
     try:
+        parsed_url = urlparse(url)
+        host = parsed_url.hostname if parsed_url.hostname else url
+
+        result = subprocess.run(['curl', '-I', f'http://{host}'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        if result.returncode == 0 and "Hostinger" in result.stdout:
+            print(f"Hostinger platform found: {url}")
+            return url
+        else:
+            print(f"Not Hostinger: {url}")
+            return None
+    except Exception as e:
+        print(f"An error occurred for {url}: {str(e)}")
+        return None
+
+def process_website(url):
+    if check_xsrf_token(url):
+        result = check_hostinger(url)
+        if result:
+            result_queue.put(result) 
+    else:
+        print(f"Skipping {url}: XSRF-TOKEN not found")
+
+def save_results(result_file):
+    with open(result_file, "a") as file:
+        while True:
+            try:
+                result = result_queue.get(timeout=5)  
+                if result is None:  
+                    break
+                file.write(f"{result}\n")  
+                file.flush()  
+            except queue.Empty:
+                if all(future.done() for future in futures):
+                    break
+
+def process_websites(input_file, result_file):
+    if os.path.exists(input_file):
         with open(input_file, "r") as file:
             websites = [line.strip() for line in file if line.strip()]
-    except FileNotFoundError:
-        print(f"File {input_file} tidak ditemukan.")
-        return
 
-    # Inisialisasi threading
-    results = []
-    result_lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            global futures
+            futures = [executor.submit(process_website, url) for url in websites]
 
-    # Menggunakan ThreadPoolExecutor untuk mengelola thread dengan lebih efisien
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(process_website, url, result_lock, results) for url in websites]
+            writer_thread = threading.Thread(target=save_results, args=(result_file,))
+            writer_thread.start()
 
-        # Menunggu semua thread selesai
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                print(f"Error: {e}")
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error: {e}")
 
-    # Menyimpan hasil ke file
-    with open(output_file, "w") as file:
-        for url in results:
-            file.write(url + "\n")
+            result_queue.put(None)
+            writer_thread.join()  
+    else:
+        print(f"File {input_file} not found!")
 
-    print(f"Hasil disimpan ke {output_file}")
+input_file = "websites.txt"  
+result_file = "result.txt"
 
-if __name__ == "__main__":
-    main()
+process_websites(input_file, result_file)
