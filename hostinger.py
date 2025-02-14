@@ -1,88 +1,74 @@
-import subprocess
+import requests
 import threading
-import os
-from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
+import os
 
-result_queue = queue.Queue()
+input_file = "mikir.txt"
 
-def check_xsrf_token(url):
+output_hostinger = "result_hostinger.txt"
+output_litespeed = "result_litespeed.txt"
+output_all = "result_all.txt"
+
+domain_queue = queue.Queue()
+
+def prepare_url(domain):
+    return [f"http://{domain}", f"https://{domain}"]
+
+def check_headers_and_cookies(url):
     try:
-        parsed_url = urlparse(url)
-        host = parsed_url.hostname if parsed_url.hostname else url
+        response = requests.get(url, timeout=5, allow_redirects=True)
+        headers = response.headers
+        cookies = headers.get("set-cookie", "")
 
-        result = subprocess.run(['curl', '-I', f'http://{host}'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        xsrf_token = any("xsrf-token" in cookie.lower() for cookie in cookies.split(","))
 
-        if result.returncode == 0 and "XSRF-TOKEN" in result.stdout:
-            return True
-        return False
-    except Exception as e:
-        print(f"An error occurred while checking XSRF-TOKEN for {url}: {str(e)}")
-        return False
+        hostinger_platform = "hostinger" in headers.get("platform", "").lower()
 
-def check_hostinger(url):
-    try:
-        parsed_url = urlparse(url)
-        host = parsed_url.hostname if parsed_url.hostname else url
+        litespeed_server = "litespeed" in headers.get("server", "").lower()
 
-        result = subprocess.run(['curl', '-I', f'http://{host}'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        print(f"[CHECKED] {url} - XSRF-TOKEN: {xsrf_token}, Hostinger: {hostinger_platform}, LiteSpeed: {litespeed_server}")
 
-        if result.returncode == 0 and "Hostinger" in result.stdout:
-            print(f"Hostinger platform found: {url}")
-            return url
-        else:
-            print(f"Not Hostinger: {url}")
-            return None
-    except Exception as e:
-        print(f"An error occurred for {url}: {str(e)}")
-        return None
+        if xsrf_token and hostinger_platform and litespeed_server:
+            save_to_file(output_all, url)
+        elif xsrf_token and hostinger_platform and not litespeed_server:
+            save_to_file(output_hostinger, url)
+        elif xsrf_token and litespeed_server and not hostinger_platform:
+            save_to_file(output_litespeed, url)
 
-def process_website(url):
-    if check_xsrf_token(url):
-        result = check_hostinger(url)
-        if result:
-            result_queue.put(result) 
-    else:
-        print(f"Skipping {url}: XSRF-TOKEN not found")
+    except requests.RequestException:
+        print(f"[CHECKED] {url} - ERROR (Request Failed)")
 
-def save_results(result_file):
-    with open(result_file, "a") as file:
-        while True:
-            try:
-                result = result_queue.get(timeout=5)  
-                if result is None:  
-                    break
-                file.write(f"{result}\n")  
-                file.flush()  
-            except queue.Empty:
-                if all(future.done() for future in futures):
-                    break
+def save_to_file(filename, url):
+    with open(filename, "a") as file:
+        file.write(url + "\n")
+    os.fsync(file.fileno()) 
+    print(f"[SAVED] {url} -> {filename}")
 
-def process_websites(input_file, result_file):
-    if os.path.exists(input_file):
-        with open(input_file, "r") as file:
-            websites = [line.strip() for line in file if line.strip()]
+def worker():
+    while not domain_queue.empty():
+        domain = domain_queue.get()
+        for prepared_url in prepare_url(domain):
+            check_headers_and_cookies(prepared_url)
+        domain_queue.task_done()
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            global futures
-            futures = [executor.submit(process_website, url) for url in websites]
+def main():
+    with open(input_file, "r") as file:
+        for line in file:
+            domain = line.strip()
+            if domain:  
+                domain_queue.put(domain)
 
-            writer_thread = threading.Thread(target=save_results, args=(result_file,))
-            writer_thread.start()
+    threads = []
+    num_threads = 5 
+    for _ in range(num_threads):
+        thread = threading.Thread(target=worker)
+        thread.daemon = True 
+        thread.start()
+        threads.append(thread)
 
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"Error: {e}")
+    domain_queue.join()
 
-            result_queue.put(None)
-            writer_thread.join()  
-    else:
-        print(f"File {input_file} not found!")
+    print("\nProses selesai. Hasil telah disimpan.")
 
-input_file = "websites.txt"  
-result_file = "result.txt"
-
-process_websites(input_file, result_file)
+if __name__ == "__main__":
+    main()
